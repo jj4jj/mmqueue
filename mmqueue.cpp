@@ -1,4 +1,3 @@
-
 #include "mmqueue.h"
 #include "base/stdinc.h"
 #include "base/dcsmq.h"
@@ -9,12 +8,13 @@
 //int munmap(void *addr, size_t length);
 //int msync(void *addr, size_t length, int flags);
 
+#define MMQ_DISPATCHER_MSG_TYPE     (0XAA55AA)
 using std::vector;
 using std::string;
 using std::thread;
 using std::mutex;
 using std::condition_variable;
-
+using std::unique_lock;
 struct mmqueue_t {
     mmqueue_config_t conf;
     void *              work_ctx;
@@ -22,6 +22,8 @@ struct mmqueue_t {
     vector<thread>      workers;
     mutex               lock;
     dcsmq_t             *mq;
+    bool                stop;
+    condition_variable  signal;
 };
 #define MAX_WORKER_NUM 128
 static inline int 
@@ -38,18 +40,39 @@ _check_conf(const mmqueue_config_t * conf){
 }
 
 struct worker_param {
-    void *  ctx;
-    int     idx;
+    mmqueue_t * mq;
+    int         idx;
 };
 
 static void *
 _worker(void * p){
     worker_param * param = (worker_param*)p;
-    //fetch msg
-    //...
+    char * msg_recv_buff = new char [param->mq->conf.max_input_msg_size];
+    char * msg_send_buff = new char [param->mq->conf.max_output_msg_size];
+    dcsmq_msg_t dcmsg;
+    uint64_t    reciver;
+    while (!param->mq->stop){
+        dcmsg.buffer = msg_recv_buff;
+        dcmsg.sz = param->mq->conf.max_input_msg_size;
+        param->mq->lock.lock();
+        reciver = dcsmq_pop(param->mq->mq, dcmsg);
+        param->mq->lock.unlock();
+        if (reciver == (uint64_t)-1){ //empty msg
+            unique_lock<std::mutex>    ulck(param->mq->lock);
+            param->mq->signal.wait_for(ulck, std::chrono::seconds(1));
+        }
+        else {
+            size_t omsg_sz = param->mq->conf.max_output_msg_size;
+            param->mq->work(param->mq->work_ctx, param->idx, msg_send_buff, &omsg_sz, dcmsg.buffer, dcmsg.sz);
+            param->mq->lock.lock();
+            dcsmq_push(param->mq->mq, param->idx, dcsmq_msg_t(msg_send_buff, omsg_sz));
+            param->mq->lock.unlock();
+        }
+    }
+    delete msg_recv_buff;
+    delete msg_send_buff;
+    return nullptr;
 }
-
-
 mmqueue_t *    
 mmqueue_create(const mmqueue_config_t * conf, mmqueue_work_t work, void * ctx){
     if (_check_conf(conf)){
@@ -68,6 +91,7 @@ mmqueue_create(const mmqueue_config_t * conf, mmqueue_work_t work, void * ctx){
     mconf.max_queue_buff_size = conf->max_queue_size * std::max(conf->max_output_msg_size, conf->max_input_msg_size);
     mconf.msg_buffsz = std::max(conf->max_output_msg_size, conf->max_input_msg_size);
     mconf.passive = false;
+    q->stop = false;
     q->mq = dcsmq_create(mconf);
     if (!q->mq){
         GLOG_ERR("error create dcmsg queue !");
@@ -78,15 +102,44 @@ mmqueue_create(const mmqueue_config_t * conf, mmqueue_work_t work, void * ctx){
     q->work_ctx = ctx;
     static worker_param param[MAX_WORKER_NUM];
     for (int i = 0; i < conf->max_worker; ++i){
-        param[i].ctx = ctx;
+        param[i].mq = q;
         param[i].idx = i;
         q->workers[i] = thread(_worker, &param[i]);
         q->workers[i].detach();
     }
     return q;
 }
-void            mmqueue_destroy(mmqueue_t *){
+void
+mmqueue_destroy(mmqueue_t * mq){
+    if (mq){
+        delete mq;
+    }
+}
+void
+mmqueue_stop(mmqueue_t * mq){
+    mq->stop = true;
+}
+int
+mmqueue_put(mmqueue_t * mq, const void * msg, size_t msg_sz){
+    int ret;
+    mq->lock.lock();
+    ret = dcsmq_send(mq->mq, MMQ_DISPATCHER_MSG_TYPE, dcsmq_msg_t((char*)msg, msg_sz));
+    mq->lock.unlock();
+    return ret;
+}
+int
+mmqueue_take(mmqueue_t * mq, void * msg, size_t * msg_szp){
+    dcsmq_msg_t dcmsg((char*)msg, *msg_szp);
+    uint64_t msgid =  dcsmq_recv(mq->mq, dcmsg);
+    if (msgid != (uint64_t)-1){
+        assert(msgid == MMQ_DISPATCHER_MSG_TYPE);
+        memmove(msg, dcmsg.buffer, dcmsg.sz);
+        *msg_szp = dcmsg.sz;
+        return 0;
+    }
+    return -1;
 
 }
-int             mmqueue_put(mmqueue_t *, const void * msg, size_t msg_sz);//input
-int             mmqueue_take(mmqueue_t *, void * msg, size_t * msg_szp)
+
+
+
