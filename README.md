@@ -1,2 +1,2 @@
 # mmqueue
-a multi rw queue with share memory  or mmap 
+multi task processor with msgq (system)
